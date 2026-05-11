@@ -53,6 +53,11 @@
 #   --hsts                    adiciona HSTS após emitir o cert
 #   --open-firewall           abre 80/443 (ufw OU firewalld) se ativo
 #   --install-webserver       instala o webserver escolhido sem perguntar
+#   --certbot-method METHOD   como instalar/atualizar o certbot:
+#                               auto = pacote do SO; se faltar plugin, oferece snap (default)
+#                               pkg  = só via gerenciador do SO (apt/dnf/yum)
+#                               snap = via snap (versão mais nova; útil em SO antigos como CentOS 7)
+#                               keep = não tocar no certbot já instalado
 #   -y, --yes                 não pede nenhuma confirmação
 #   -h, --help                esta ajuda
 #
@@ -94,6 +99,7 @@ USE_STAGING="no"
 ENABLE_HSTS="no"
 OPEN_FIREWALL="no"
 INSTALL_WS_AUTO="no"
+CERTBOT_METHOD="auto"   # auto | pkg | snap | keep
 ASSUME_YES="no"
 
 while [[ $# -gt 0 ]]; do
@@ -108,11 +114,13 @@ while [[ $# -gt 0 ]]; do
         --hsts)              ENABLE_HSTS="yes"; shift ;;
         --open-firewall)     OPEN_FIREWALL="yes"; shift ;;
         --install-webserver) INSTALL_WS_AUTO="yes"; shift ;;
+        --certbot-method)    CERTBOT_METHOD="$2"; shift 2 ;;
         -y|--yes)            ASSUME_YES="yes"; shift ;;
         -h|--help)           usage 0 ;;
         *) die "flag desconhecida: $1 (use -h para ajuda)" ;;
     esac
 done
+case "$CERTBOT_METHOD" in auto|pkg|snap|keep) ;; *) die "--certbot-method inválido: $CERTBOT_METHOD (auto|pkg|snap|keep)" ;; esac
 
 prompt() {
     local label="$1" default="${2:-}" hint="" reply=""
@@ -210,7 +218,27 @@ pkg_install() {
             $PKG_MGR install -y epel-release 2>/dev/null || true
         fi
         $PKG_MGR install -y "$@"
+        # yum/dnf NÃO falham quando o pacote não existe — só ignoram. Valide.
+        local missing=()
+        for p in "$@"; do
+            rpm -q "$p" >/dev/null 2>&1 || missing+=("$p")
+        done
+        if [[ ${#missing[@]} -gt 0 ]]; then
+            die "falha instalando em ${OS_PRETTY}: ${missing[*]} (pacote pode não existir nesta versão do SO)"
+        fi
     fi
+}
+
+# detecta se um IP é privado (RFC1918, loopback, link-local, CGNAT)
+is_private_ip() {
+    local ip="$1"
+    [[ "$ip" =~ ^10\. ]] && return 0
+    [[ "$ip" =~ ^192\.168\. ]] && return 0
+    [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && return 0
+    [[ "$ip" =~ ^127\. ]] && return 0
+    [[ "$ip" =~ ^169\.254\. ]] && return 0
+    [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]] && return 0
+    return 1
 }
 
 pick_webserver() {
@@ -233,15 +261,21 @@ pick_webserver() {
     fi
     [[ "$WEBSERVER" == "apache" || "$WEBSERVER" == "nginx" ]] || die "webserver inválido: $WEBSERVER (use apache ou nginx)"
 
+    # CentOS 7 não tem pacotes python3-certbot-*; usa python2-certbot-*
+    local cb_prefix="python3"
+    if [[ "$OS_FAMILY" == "rhel" ]] && [[ "${OS_VERSION_ID%%.*}" == "7" ]]; then
+        cb_prefix="python2"
+    fi
+
     if [[ "$WEBSERVER" == "apache" ]]; then
-        WS_NAME="apache"; WS_CB_FLAG="--apache"; WS_CB_PKG="python3-certbot-apache"
+        WS_NAME="apache"; WS_CB_FLAG="--apache"; WS_CB_PKG="${cb_prefix}-certbot-apache"
         if [[ "$OS_FAMILY" == "debian" ]]; then
             WS_PKG="apache2"; WS_SERVICE="apache2"
         else
             WS_PKG="httpd";   WS_SERVICE="httpd"
         fi
     else
-        WS_NAME="nginx"; WS_CB_FLAG="--nginx"; WS_CB_PKG="python3-certbot-nginx"
+        WS_NAME="nginx"; WS_CB_FLAG="--nginx"; WS_CB_PKG="${cb_prefix}-certbot-nginx"
         WS_PKG="nginx";  WS_SERVICE="nginx"
     fi
 }
@@ -414,6 +448,78 @@ ws_apply_hsts() {
     fi
 }
 
+# ---------- certbot: pkg / snap ----------------------------------------------
+certbot_via_pkg() {
+    info "  Instalando/atualizando certbot via ${PKG_MGR}..."
+    pkg_install certbot "$WS_CB_PKG"
+    ok "  certbot via pkg: $(certbot --version 2>&1)"
+}
+certbot_via_snap() {
+    info "  Preparando snap..."
+    if ! command -v snap >/dev/null 2>&1; then
+        if [[ "$OS_FAMILY" == "debian" ]]; then
+            pkg_install snapd
+            systemctl enable --now snapd.socket || true
+        else
+            pkg_install snapd
+            systemctl enable --now snapd.socket || true
+            [[ -e /snap ]] || ln -sf /var/lib/snapd/snap /snap
+            sleep 5
+        fi
+    fi
+    # remove certbot via pacote pra evitar conflito de PATH
+    if rpm -q certbot >/dev/null 2>&1; then $PKG_MGR remove -y certbot "$WS_CB_PKG" 2>/dev/null || true; fi
+    if dpkg -s certbot >/dev/null 2>&1; then apt-get remove -y -qq certbot "$WS_CB_PKG" 2>/dev/null || true; fi
+    snap install --classic certbot
+    ln -sfn /snap/bin/certbot /usr/bin/certbot
+    ok "  certbot via snap: $(certbot --version 2>&1)"
+}
+certbot_has_plugin() {
+    certbot plugins 2>/dev/null | grep -qiw "$WS_NAME"
+}
+install_or_update_certbot() {
+    local current=""
+    command -v certbot >/dev/null 2>&1 && current="$(certbot --version 2>&1 | head -1)"
+
+    case "$CERTBOT_METHOD" in
+        keep)
+            [[ -n "$current" ]] || die "certbot não instalado, mas --certbot-method=keep foi passado"
+            info "  Mantendo certbot existente: $current"
+            return ;;
+        pkg)   certbot_via_pkg  ; return ;;
+        snap)  certbot_via_snap ; return ;;
+    esac
+
+    # auto:
+    if [[ -n "$current" ]]; then
+        info "  certbot já instalado: ${C_BLD}${current}${C_RST}"
+        if [[ "$ASSUME_YES" == "yes" ]]; then return; fi
+        local choice
+        choice="$(menu 'O que fazer com o certbot existente?' \
+                        'manter como está|atualizar via pkg do SO|reinstalar via snap (versão mais nova — recomendado em SO antigos)')"
+        case "$choice" in
+            'manter como está')                                                       return ;;
+            'atualizar via pkg do SO')                                                certbot_via_pkg  ;;
+            'reinstalar via snap (versão mais nova — recomendado em SO antigos)')   certbot_via_snap ;;
+        esac
+    else
+        certbot_via_pkg
+    fi
+
+    # valida plugin do webserver depois de instalar/atualizar via pkg;
+    # se faltar, oferece snap
+    if ! certbot_has_plugin; then
+        warn "  Plugin '${WS_NAME}' do certbot NÃO está disponível via pacote do SO."
+        warn "  Isso acontece em distros antigas (ex: CentOS 7) ou quando o pacote ${WS_CB_PKG} não existe."
+        if [[ "$ASSUME_YES" == "yes" ]] || confirm "Tentar instalar via snap (versão mais nova)?"; then
+            certbot_via_snap
+        else
+            die "plugin '${WS_NAME}' indisponível — abortado. Tente: sudo bash $0 --certbot-method snap"
+        fi
+    fi
+    certbot_has_plugin || die "plugin '${WS_NAME}' ainda indisponível depois do snap. Investigue 'certbot plugins'."
+}
+
 # =============================================================================
 # FLUXO PRINCIPAL
 # =============================================================================
@@ -422,6 +528,11 @@ pick_webserver
 install_webserver_if_needed
 ensure_webserver_running
 detect_firewall
+
+# ---------- certbot: instalar / atualizar / manter ---------------------------
+echo
+info "Certbot: instalar / atualizar / manter"
+install_or_update_certbot
 
 # ---------- coleta interativa -------------------------------------------------
 if [[ ${#DOMAINS[@]} -eq 0 ]]; then
@@ -472,7 +583,14 @@ fi
 
 if [[ "$ENABLE_HSTS" == "no" ]] && [[ "$ASSUME_YES" != "yes" ]]; then
     echo
-    confirm "Ativar HSTS (Strict-Transport-Security) no HTTPS?" && ENABLE_HSTS="yes"
+    info "HSTS (HTTP Strict Transport Security): cabeçalho que diz ao navegador"
+    info "  ${C_BLD}\"só me acesse por HTTPS daqui pra frente\"${C_RST} — mesmo se o usuário digitar"
+    info "  http:// ou clicar em link antigo, o navegador converte sozinho."
+    info "  ${C_GRN}Vantagem:${C_RST} bloqueia tentativas de downgrade pra HTTP."
+    info "  ${C_YLW}Atenção:${C_RST} se um dia o HTTPS quebrar (cert vencido, problema no"
+    info "  servidor), os navegadores que memorizaram o HSTS ${C_BLD}SE RECUSAM${C_RST} a abrir"
+    info "  o site pelo período configurado (1 ano). Ative só em produção estável."
+    confirm "Ativar HSTS no HTTPS?" && ENABLE_HSTS="yes"
 fi
 
 # ---------- DNS ---------------------------------------------------------------
@@ -482,23 +600,64 @@ PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
             || curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
             || true)"
 info "  IP público desta máquina: ${PUBLIC_IP:-desconhecido}"
-DNS_PROBLEMS=0
+
+DNS_PROBLEMS_PRIVATE=0
+DNS_PROBLEMS_MISMATCH=0
+DNS_PROBLEMS_NORESOLVE=0
 for d in "${DOMAINS[@]}"; do
     ips="$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
     if [[ -z "$ips" ]]; then
         err "  ${d}: DNS NÃO resolve (verifique o registro A)"
-        DNS_PROBLEMS=$((DNS_PROBLEMS+1)); continue
+        DNS_PROBLEMS_NORESOLVE=$((DNS_PROBLEMS_NORESOLVE+1)); continue
     fi
-    if [[ -n "$PUBLIC_IP" ]] && ! echo "$ips" | grep -qw "$PUBLIC_IP"; then
-        warn "  ${d} -> ${ips} (não bate com IP público ${PUBLIC_IP})"
-        DNS_PROBLEMS=$((DNS_PROBLEMS+1))
-    else
+    # classifica IPs resolvidos
+    match_public="no"; only_private="yes"; has_public_mismatch="no"
+    for ip in $ips; do
+        if is_private_ip "$ip"; then
+            :
+        else
+            only_private="no"
+            if [[ "$ip" == "$PUBLIC_IP" ]]; then match_public="yes"; else has_public_mismatch="yes"; fi
+        fi
+    done
+    if [[ "$match_public" == "yes" ]]; then
         ok   "  ${d} -> ${ips}"
+    elif [[ "$only_private" == "yes" ]]; then
+        info "  ${d} -> ${ips}  ${C_YLW}(IP privado — uso interno/intranet)${C_RST}"
+        DNS_PROBLEMS_PRIVATE=$((DNS_PROBLEMS_PRIVATE+1))
+    else
+        warn "  ${d} -> ${ips} (não bate com IP público ${PUBLIC_IP})"
+        DNS_PROBLEMS_MISMATCH=$((DNS_PROBLEMS_MISMATCH+1))
     fi
 done
-if [[ $DNS_PROBLEMS -gt 0 ]]; then
-    warn "${DNS_PROBLEMS} domínio(s) com problema de DNS — certbot pode falhar."
-    confirm "Continuar?" || die "abortado"
+
+# mensagens contextuais
+if [[ $DNS_PROBLEMS_PRIVATE -gt 0 ]]; then
+    echo
+    info "${C_BLD}Atenção — domínio aponta para IP privado:${C_RST}"
+    info "  Isso é normal quando a aplicação só é acessada pela intranet (VPN, rede"
+    info "  interna, NAT inverso). MAS o Let's Encrypt valida o certificado batendo"
+    info "  no domínio ${C_BLD}pela Internet pública${C_RST} (challenge HTTP-01) — se o domínio"
+    info "  só resolve para IP privado externamente, essa validação ${C_RED}vai falhar${C_RST}."
+    info "  Para HTTPS em ambiente intranet, opções comuns:"
+    info "    • DNS público apontando para o IP público + porta liberada (típico)"
+    info "    • Split-horizon DNS (público responde IP público; interno responde privado)"
+    info "    • Challenge DNS-01 do certbot (cert via TXT record) — fora do escopo deste script"
+    info "    • Certificado auto-assinado ou CA interna"
+fi
+if [[ $DNS_PROBLEMS_MISMATCH -gt 0 ]]; then
+    echo
+    warn "${C_BLD}Domínio aponta para um IP público ≠ desta máquina.${C_RST}"
+    warn "  Let's Encrypt vai bater no servidor errado durante o challenge HTTP-01"
+    warn "  e o certbot vai falhar. Confira o registro A do domínio no seu DNS."
+fi
+if [[ $DNS_PROBLEMS_NORESOLVE -gt 0 ]]; then
+    echo
+    err "${DNS_PROBLEMS_NORESOLVE} domínio(s) sem resolução DNS — corrija antes de seguir."
+fi
+if (( DNS_PROBLEMS_PRIVATE + DNS_PROBLEMS_MISMATCH + DNS_PROBLEMS_NORESOLVE > 0 )); then
+    echo
+    confirm "Continuar mesmo assim?" || die "abortado"
 fi
 
 # ---------- vhost path / duplicado -------------------------------------------
@@ -561,19 +720,9 @@ do_rollback()  {
 }
 trap 'rc=$?; if [[ $rc -ne 0 ]]; then err "falha (exit $rc) — revertendo"; do_rollback; fi' EXIT
 
-# ---------- [1/6] certbot -----------------------------------------------------
+# ---------- [1/5] VHost -------------------------------------------------------
 echo
-info "[1/6] Instalando certbot + plugin ${WS_NAME}"
-if command -v certbot >/dev/null 2>&1; then
-    ok "  certbot já instalado: $(certbot --version 2>&1)"
-else
-    pkg_install certbot "$WS_CB_PKG"
-    ok "  certbot instalado: $(certbot --version 2>&1)"
-fi
-
-# ---------- [2/6] VHost -------------------------------------------------------
-echo
-info "[2/6] Escrevendo VHost ${WS_VHOST_FILE}"
+info "[1/5] Escrevendo VHost ${WS_VHOST_FILE}"
 mkdir -p "$(dirname "$WS_VHOST_FILE")"
 if [[ -f "$WS_VHOST_FILE" ]]; then
     backup="${WS_VHOST_FILE}.bak.${BACKUP_TAG}"
@@ -588,9 +737,9 @@ else                                  nginx_write_vhost
 fi
 ws_configtest
 
-# ---------- [3/6] enable + reload --------------------------------------------
+# ---------- [2/5] enable + reload --------------------------------------------
 echo
-info "[3/6] Habilitando site e recarregando ${WS_SERVICE}"
+info "[2/5] Habilitando site e recarregando ${WS_SERVICE}"
 if [[ "$WS_NAME" == "apache" ]]; then apache_enable_site
 else                                  nginx_enable_site
 fi
@@ -600,9 +749,9 @@ add_rollback "if [[ '$WS_NAME' == apache && '$OS_FAMILY' == debian ]]; then a2di
 ws_reload
 ok "  ${WS_SERVICE} recarregado."
 
-# ---------- [4/6] certbot run -------------------------------------------------
+# ---------- [3/5] certbot run -------------------------------------------------
 echo
-info "[4/6] Solicitando certificado Let's Encrypt (HTTP-01 / plugin ${WS_NAME})"
+info "[3/5] Solicitando certificado Let's Encrypt (HTTP-01 / plugin ${WS_NAME})"
 CERTBOT_ARGS=("$WS_CB_FLAG" -m "$EMAIL" --non-interactive --agree-tos --keep-until-expiring)
 for d in "${DOMAINS[@]}"; do CERTBOT_ARGS+=(-d "$d"); done
 [[ "$HTTP_REDIRECT" == "yes" ]] && CERTBOT_ARGS+=(--redirect) || CERTBOT_ARGS+=(--no-redirect)
@@ -610,18 +759,18 @@ for d in "${DOMAINS[@]}"; do CERTBOT_ARGS+=(-d "$d"); done
 certbot "${CERTBOT_ARGS[@]}"
 add_rollback "certbot delete --cert-name '${PRIMARY}' --non-interactive >/dev/null 2>&1 || true"
 
-# ---------- [5/6] HSTS --------------------------------------------------------
+# ---------- [4/5] HSTS --------------------------------------------------------
 echo
 if [[ "$ENABLE_HSTS" == "yes" ]]; then
-    info "[5/6] Aplicando HSTS"
+    info "[4/5] Aplicando HSTS"
     ws_apply_hsts
 else
-    info "[5/6] HSTS: pulado (não solicitado)"
+    info "[4/5] HSTS: pulado (não solicitado)"
 fi
 
-# ---------- [6/6] validação ---------------------------------------------------
+# ---------- [5/5] validação ---------------------------------------------------
 echo
-info "[6/6] Validando endpoints"
+info "[5/5] Validando endpoints"
 hr
 for d in "${DOMAINS[@]}"; do
     echo "  http://${d}/ :"
