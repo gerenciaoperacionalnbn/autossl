@@ -1,38 +1,41 @@
 #!/usr/bin/env bash
 # =============================================================================
-# setup_apache_letsencrypt.sh
+# autossl.sh
 # -----------------------------------------------------------------------------
-# Configura HTTPS via Let's Encrypt em um servidor Linux com Apache.
+# Configura HTTPS via Let's Encrypt em um servidor Linux, em cima de Apache
+# OU Nginx, com suporte para as duas famílias de distros mais comuns.
 #
 # Pré-requisito (responsabilidade do operador, NÃO deste script):
 #   1. O domínio (registro A no DNS) tem que apontar para o IP público
 #      desta máquina. Aguarde a propagação antes de rodar.
 #   2. Portas 80 e 443 acessíveis pela Internet (firewall/NAT/cloud SG).
 #
-# O que o script faz sozinho:
-#   - Detecta distribuição (Debian/Ubuntu).
-#   - Instala Apache se não houver (sob confirmação).
-#   - Instala certbot + plugin Apache.
-#   - Confere se o DNS resolve para o IP desta máquina.
-#   - Detecta VirtualHost duplicado e pede confirmação para sobrescrever.
-#   - Cria VirtualHost em /etc/apache2/sites-available/<dominio>.conf.
-#   - Opcional: redireciona "/" para um subdiretório (ex: /zabbix/, /grafana/).
-#   - Opcional: aplica DocumentRoot customizado (servir app na raiz do site).
-#   - Opcional: abre UFW para 80/443.
-#   - Opcional: ativa "Apache hardening" (HSTS, X-Content-Type-Options).
-#   - Emite o certificado via certbot --apache, com --redirect (HTTP→HTTPS).
-#   - Suporta múltiplos domínios (-d <dom> repetido), útil para www.
-#   - Suporta --staging para testar sem queimar rate-limit do Let's Encrypt.
-#   - Rollback automático em qualquer falha: backup dos confs, a2dissite,
-#     certbot delete.
-#   - Loga toda execução em /var/log/setup_apache_letsencrypt.log.
-#   - Mostra status do timer de renovação automática no final.
+# Sistemas operacionais suportados:
+#   ┌─────────────────────────────────────────┬──────────┬──────────────────┐
+#   │ Distribuição                            │ Status   │ Gerenciador      │
+#   ├─────────────────────────────────────────┼──────────┼──────────────────┤
+#   │ Debian 11 / 12                          │ ok       │ apt              │
+#   │ Ubuntu 20.04 / 22.04 / 24.04            │ ok       │ apt              │
+#   │ CentOS 7                                │ parcial* │ yum              │
+#   │ CentOS Stream 8 / 9                     │ ok       │ dnf              │
+#   │ Rocky / AlmaLinux 8 / 9                 │ ok       │ dnf              │
+#   │ RHEL 8 / 9                              │ ok       │ dnf              │
+#   │ Fedora (recente)                        │ ok       │ dnf              │
+#   │ Outras                                  │ untested │ (tenta detectar) │
+#   └─────────────────────────────────────────┴──────────┴──────────────────┘
+#   * CentOS 7: EOL desde jun/2024; certbot via EPEL costuma funcionar mas
+#     não recebe mais atualizações de segurança.
 #
-# Uso (interativo — recomendado para a maioria dos casos):
-#     sudo bash setup_apache_letsencrypt.sh
+# Servidores web suportados:
+#   - Apache (apache2 no Debian/Ubuntu, httpd no RHEL family)
+#   - Nginx
+#
+# Uso (interativo — recomendado):
+#     sudo bash autossl.sh
 #
 # Uso não-interativo (CI / automação):
-#     sudo bash setup_apache_letsencrypt.sh \
+#     sudo bash autossl.sh \
+#         --webserver apache \
 #         -d app.example.com.br \
 #         -d www.app.example.com.br \
 #         --email admin@example.com.br \
@@ -40,38 +43,36 @@
 #         --hsts --open-firewall --yes
 #
 # Flags:
-#   -d, --domain DOM         domínio (pode repetir; o primeiro é o principal)
-#   --email EMAIL            e-mail para conta Let's Encrypt
-#   --redirect-root PATH     "/" → PATH (ex: /zabbix/). Vazio = não redireciona.
-#   --document-root DIR      DocumentRoot do VHost (ex: /var/www/app). Vazio =
-#                            usa o default do Apache (/var/www/html).
-#   --staging                usa staging do Let's Encrypt (cert não confiável,
-#                            ideal para testar)
-#   --no-http-redirect       NÃO força HTTP→HTTPS (default: força)
-#   --hsts                   adiciona HSTS no VHost SSL após emitir o cert
-#   --open-firewall          abre UFW 80/443/tcp se UFW estiver ativo
-#   --install-apache         instala apache2 se não houver (sem perguntar)
-#   -y, --yes                não pede nenhuma confirmação
-#   -h, --help               esta ajuda
+#   --webserver apache|nginx  força um webserver (default: detecta/pergunta)
+#   -d, --domain DOM          domínio (pode repetir; 1º é o principal)
+#   --email EMAIL             e-mail para conta Let's Encrypt
+#   --redirect-root PATH      "/" → PATH (ex: /zabbix/). Vazio = não redireciona
+#   --document-root DIR       DocumentRoot do VHost (ex: /var/www/app)
+#   --staging                 usa staging Let's Encrypt (cert não confiável)
+#   --no-http-redirect        NÃO força HTTP→HTTPS (default: força)
+#   --hsts                    adiciona HSTS após emitir o cert
+#   --open-firewall           abre 80/443 (ufw OU firewalld) se ativo
+#   --install-webserver       instala o webserver escolhido sem perguntar
+#   -y, --yes                 não pede nenhuma confirmação
+#   -h, --help                esta ajuda
 #
-# Licença: MIT — script público, livre para uso/modificação.
+# Licença: MIT
 # =============================================================================
 
 set -euo pipefail
 
-# ---------- cores e helpers ---------------------------------------------------
+# ---------- cores + log -------------------------------------------------------
 if [[ -t 1 ]]; then
     C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YLW=$'\033[0;33m'
     C_CYN=$'\033[0;36m'; C_BLD=$'\033[1m';   C_RST=$'\033[0m'
 else
     C_RED=""; C_GRN=""; C_YLW=""; C_CYN=""; C_BLD=""; C_RST=""
 fi
-
-LOG_FILE="/var/log/setup_apache_letsencrypt.log"
-log() {  # log "msg" — escreve em stdout e no log
-    local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"
+LOG_FILE="/var/log/autossl.log"
+log()  {
     echo -e "$@"
-    echo "[${ts}] $(echo -e "$@" | sed 's/\x1b\[[0-9;]*m//g')" >> "$LOG_FILE" 2>/dev/null || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $(echo -e "$@" | sed 's/\x1b\[[0-9;]*m//g')" \
+         >> "$LOG_FILE" 2>/dev/null || true
 }
 info() { log "${C_CYN}[info]${C_RST}  $*"; }
 ok()   { log "${C_GRN}[ ok ]${C_RST}  $*"; }
@@ -82,7 +83,8 @@ hr()   { log "------------------------------------------------------------"; }
 
 usage() { sed -n '2,/^# ===/p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-# ---------- defaults e flags --------------------------------------------------
+# ---------- defaults / flags --------------------------------------------------
+WEBSERVER=""
 DOMAINS=()
 EMAIL=""
 REDIRECT_ROOT=""
@@ -91,11 +93,12 @@ HTTP_REDIRECT="yes"
 USE_STAGING="no"
 ENABLE_HSTS="no"
 OPEN_FIREWALL="no"
-INSTALL_APACHE_AUTO="no"
+INSTALL_WS_AUTO="no"
 ASSUME_YES="no"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --webserver)         WEBSERVER="$2"; shift 2 ;;
         -d|--domain)         DOMAINS+=("$2"); shift 2 ;;
         --email)             EMAIL="$2"; shift 2 ;;
         --redirect-root)     REDIRECT_ROOT="$2"; shift 2 ;;
@@ -104,68 +107,330 @@ while [[ $# -gt 0 ]]; do
         --no-http-redirect)  HTTP_REDIRECT="no"; shift ;;
         --hsts)              ENABLE_HSTS="yes"; shift ;;
         --open-firewall)     OPEN_FIREWALL="yes"; shift ;;
-        --install-apache)    INSTALL_APACHE_AUTO="yes"; shift ;;
+        --install-webserver) INSTALL_WS_AUTO="yes"; shift ;;
         -y|--yes)            ASSUME_YES="yes"; shift ;;
         -h|--help)           usage 0 ;;
         *) die "flag desconhecida: $1 (use -h para ajuda)" ;;
     esac
 done
 
-# ---------- prompts -----------------------------------------------------------
-prompt() {  # prompt "label" "default"  -> ecoa valor lido (ou default)
-    local label="$1" default="${2:-}"
-    local hint="" reply=""
+prompt() {
+    local label="$1" default="${2:-}" hint="" reply=""
     [[ -n "$default" ]] && hint=" [${default}]"
     read -r -p "  ${label}${hint}: " reply </dev/tty || true
     echo "${reply:-$default}"
 }
-confirm() {  # confirm "pergunta"  -> exit code 0 se sim
+confirm() {
     [[ "$ASSUME_YES" == "yes" ]] && return 0
     local reply=""
     read -r -p "  $1 [s/N]: " reply </dev/tty || true
     [[ "${reply,,}" == "s" || "${reply,,}" == "sim" || "${reply,,}" == "y" || "${reply,,}" == "yes" ]]
 }
+menu() {
+    local label="$1" opts="$2" reply=""
+    local IFS='|'; local arr=($opts); IFS=' '
+    echo "  $label" >&2
+    local i
+    for i in "${!arr[@]}"; do echo "    $((i+1))) ${arr[$i]}" >&2; done
+    while true; do
+        read -r -p "  escolha [1-${#arr[@]}]: " reply </dev/tty || true
+        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#arr[@]} )); then
+            echo "${arr[$((reply-1))]}"
+            return 0
+        fi
+    done
+}
 
 # ---------- preflight ---------------------------------------------------------
 echo
-log "${C_BLD}Setup HTTPS (Apache + Let's Encrypt)${C_RST}"
+log "${C_BLD}autossl — configurador HTTPS automático (Apache/Nginx + Let's Encrypt)${C_RST}"
 hr
 info "Log desta execução: $LOG_FILE"
-
 [[ $EUID -eq 0 ]] || die "rode como root (sudo bash $0)"
-command -v apt-get >/dev/null 2>&1 || die "este script só roda em Debian/Ubuntu (apt-get não encontrado)"
 
-# distro/versão pra info
-DISTRO="$(. /etc/os-release && echo "${PRETTY_NAME:-desconhecido}")" || DISTRO="desconhecido"
-info "Distribuição: ${DISTRO}"
+# ---------- detecção de SO ----------------------------------------------------
+OS_FAMILY=""    # debian | rhel
+OS_PRETTY=""
+OS_ID=""
+OS_VERSION_ID=""
+PKG_MGR=""
+COMPAT="unknown"
 
-# Apache instalado?
-if ! command -v apache2 >/dev/null 2>&1; then
-    warn "apache2 não está instalado."
-    if [[ "$INSTALL_APACHE_AUTO" == "yes" ]] || confirm "Instalar apache2 agora?"; then
-        info "Instalando apache2..."
-        apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apache2
-        systemctl enable --now apache2
-        ok "apache2 instalado e ativo."
-    else
-        die "abortado — instale o Apache (sudo apt install apache2) e configure o site HTTP antes de rodar."
+if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    OS_PRETTY="${PRETTY_NAME:-${NAME:-desconhecido}}"
+    OS_ID="${ID:-}"
+    OS_VERSION_ID="${VERSION_ID:-}"
+    case " ${ID:-} ${ID_LIKE:-} " in
+        *" debian "*|*" ubuntu "*) OS_FAMILY="debian" ;;
+        *" rhel "*|*" centos "*|*" fedora "*|*" rocky "*|*" almalinux "*|*" ol "*)
+            OS_FAMILY="rhel" ;;
+    esac
+fi
+if [[ -z "$OS_FAMILY" ]]; then
+    if   command -v apt-get >/dev/null 2>&1; then OS_FAMILY="debian"
+    elif command -v dnf     >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then OS_FAMILY="rhel"
     fi
 fi
-if ! systemctl is-active --quiet apache2; then
-    warn "apache2 não está ativo agora — tentando iniciar..."
-    systemctl start apache2 || die "falha ao iniciar apache2; veja 'systemctl status apache2'"
+[[ -n "$OS_FAMILY" ]] || die "não consegui identificar a família do SO. Suportados: Debian/Ubuntu e RHEL/CentOS/Rocky/Alma/Fedora."
+
+if [[ "$OS_FAMILY" == "debian" ]]; then
+    PKG_MGR="apt-get"
+else
+    if command -v dnf >/dev/null 2>&1; then PKG_MGR="dnf"; else PKG_MGR="yum"; fi
 fi
+
+case "${OS_ID}_${OS_VERSION_ID%%.*}" in
+    debian_11|debian_12|ubuntu_20|ubuntu_22|ubuntu_24)    COMPAT="ok" ;;
+    centos_8|centos_9|rocky_8|rocky_9|almalinux_8|almalinux_9|rhel_8|rhel_9) COMPAT="ok" ;;
+    fedora_*) COMPAT="ok" ;;
+    centos_7) COMPAT="partial" ;;
+    *)        COMPAT="untested" ;;
+esac
+
+info "Sistema operacional: ${C_BLD}${OS_PRETTY}${C_RST}"
+info "Família/gerenciador: ${OS_FAMILY} / ${PKG_MGR}"
+case "$COMPAT" in
+    ok)        ok   "Compatibilidade: TESTADO" ;;
+    partial)   warn "Compatibilidade: PARCIAL — pode haver problemas (pacotes antigos / EOL)" ;;
+    untested)  warn "Compatibilidade: NÃO TESTADO neste SO — proceda com cautela" ;;
+    *)         warn "Compatibilidade: desconhecida" ;;
+esac
+if [[ "$COMPAT" == "partial" || "$COMPAT" == "untested" ]]; then
+    confirm "Continuar mesmo assim?" || die "abortado pelo usuário"
+fi
+
+# ---------- helpers de webserver ---------------------------------------------
+pkg_install() {
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+    else
+        if ! rpm -q epel-release >/dev/null 2>&1; then
+            $PKG_MGR install -y epel-release 2>/dev/null || true
+        fi
+        $PKG_MGR install -y "$@"
+    fi
+}
+
+pick_webserver() {
+    local has_apache="no" has_nginx="no"
+    if   command -v apache2 >/dev/null 2>&1; then has_apache="yes"
+    elif command -v httpd   >/dev/null 2>&1; then has_apache="yes"
+    fi
+    command -v nginx >/dev/null 2>&1 && has_nginx="yes"
+
+    if [[ -z "$WEBSERVER" ]]; then
+        if   [[ "$has_apache" == "yes" && "$has_nginx" == "no"  ]]; then WEBSERVER="apache"; info "Webserver detectado: Apache"
+        elif [[ "$has_apache" == "no"  && "$has_nginx" == "yes" ]]; then WEBSERVER="nginx";  info "Webserver detectado: Nginx"
+        elif [[ "$has_apache" == "yes" && "$has_nginx" == "yes" ]]; then
+            warn "Apache e Nginx instalados — qual usar?"
+            WEBSERVER="$(menu 'Webserver alvo:' 'apache|nginx')"
+        else
+            info "Nenhum webserver instalado."
+            WEBSERVER="$(menu 'Qual webserver instalar?' 'apache|nginx')"
+        fi
+    fi
+    [[ "$WEBSERVER" == "apache" || "$WEBSERVER" == "nginx" ]] || die "webserver inválido: $WEBSERVER (use apache ou nginx)"
+
+    if [[ "$WEBSERVER" == "apache" ]]; then
+        WS_NAME="apache"; WS_CB_FLAG="--apache"; WS_CB_PKG="python3-certbot-apache"
+        if [[ "$OS_FAMILY" == "debian" ]]; then
+            WS_PKG="apache2"; WS_SERVICE="apache2"
+        else
+            WS_PKG="httpd";   WS_SERVICE="httpd"
+        fi
+    else
+        WS_NAME="nginx"; WS_CB_FLAG="--nginx"; WS_CB_PKG="python3-certbot-nginx"
+        WS_PKG="nginx";  WS_SERVICE="nginx"
+    fi
+}
+
+install_webserver_if_needed() {
+    if command -v "$WS_SERVICE" >/dev/null 2>&1 \
+       || systemctl list-unit-files "${WS_SERVICE}.service" >/dev/null 2>&1; then
+        return 0
+    fi
+    warn "${WS_PKG} não está instalado."
+    if [[ "$INSTALL_WS_AUTO" == "yes" ]] || confirm "Instalar ${WS_PKG} agora?"; then
+        info "Instalando ${WS_PKG}..."
+        pkg_install "$WS_PKG"
+        systemctl enable --now "$WS_SERVICE"
+        ok "${WS_PKG} instalado e ativo."
+    else
+        die "abortado — instale ${WS_PKG} manualmente e rode de novo."
+    fi
+}
+
+ensure_webserver_running() {
+    systemctl is-active --quiet "$WS_SERVICE" && return 0
+    warn "${WS_SERVICE} não está ativo — tentando iniciar..."
+    systemctl start "$WS_SERVICE" || die "falha ao iniciar ${WS_SERVICE} (veja 'systemctl status ${WS_SERVICE}')"
+}
+
+# ---------- firewall ----------------------------------------------------------
+FIREWALL_KIND="none"
+detect_firewall() {
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        FIREWALL_KIND="ufw"
+    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        FIREWALL_KIND="firewalld"
+    fi
+}
+firewall_is_blocking_web() {
+    case "$FIREWALL_KIND" in
+        ufw)
+            ! ufw status 2>/dev/null | grep -qE "^(80|443)/tcp[[:space:]]+ALLOW" ;;
+        firewalld)
+            local zone; zone="$(firewall-cmd --get-default-zone 2>/dev/null)"
+            local svcs; svcs="$(firewall-cmd --zone="$zone" --list-services 2>/dev/null)"
+            ! echo "$svcs" | grep -qw http || ! echo "$svcs" | grep -qw https ;;
+        *)  return 1 ;;
+    esac
+}
+firewall_open_web() {
+    case "$FIREWALL_KIND" in
+        ufw)
+            ufw allow 80/tcp  || true
+            ufw allow 443/tcp || true
+            ok "UFW: 80/443 liberados." ;;
+        firewalld)
+            firewall-cmd --permanent --add-service=http  || true
+            firewall-cmd --permanent --add-service=https || true
+            firewall-cmd --reload
+            ok "firewalld: http/https liberados." ;;
+    esac
+}
+
+# ---------- por-webserver: paths + writers ------------------------------------
+apache_vhost_path() {
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+        echo "/etc/apache2/sites-available/${1}.conf"
+    else
+        echo "/etc/httpd/conf.d/${1}.conf"
+    fi
+}
+nginx_vhost_path() {
+    if [[ -d /etc/nginx/sites-available ]]; then
+        echo "/etc/nginx/sites-available/${1}.conf"
+    else
+        echo "/etc/nginx/conf.d/${1}.conf"
+    fi
+}
+apache_write_vhost() {
+    local primary="${DOMAINS[0]}"
+    {
+        echo "<VirtualHost *:80>"
+        echo "    ServerName ${primary}"
+        for d in "${DOMAINS[@]:1}"; do echo "    ServerAlias ${d}"; done
+        [[ -n "$DOCUMENT_ROOT" ]] && echo "    DocumentRoot ${DOCUMENT_ROOT}"
+        [[ -n "$REDIRECT_ROOT" ]] && echo "    RedirectMatch ^/\$ ${REDIRECT_ROOT}"
+        if [[ -n "$DOCUMENT_ROOT" ]]; then
+            echo "    <Directory ${DOCUMENT_ROOT}>"
+            echo "        Options FollowSymLinks"
+            echo "        AllowOverride All"
+            echo "        Require all granted"
+            echo "    </Directory>"
+        fi
+        if [[ "$OS_FAMILY" == "debian" ]]; then
+            echo "    ErrorLog  \${APACHE_LOG_DIR}/${primary}_error.log"
+            echo "    CustomLog \${APACHE_LOG_DIR}/${primary}_access.log combined"
+        else
+            echo "    ErrorLog  /var/log/httpd/${primary}_error.log"
+            echo "    CustomLog /var/log/httpd/${primary}_access.log combined"
+        fi
+        echo "</VirtualHost>"
+    } > "$WS_VHOST_FILE"
+}
+nginx_write_vhost() {
+    local primary="${DOMAINS[0]}"
+    {
+        echo "server {"
+        echo "    listen 80;"
+        echo "    listen [::]:80;"
+        echo "    server_name ${DOMAINS[*]};"
+        [[ -n "$DOCUMENT_ROOT" ]] && echo "    root ${DOCUMENT_ROOT};"
+        if [[ -n "$REDIRECT_ROOT" ]]; then
+            echo "    location = / { return 301 ${REDIRECT_ROOT}; }"
+        fi
+        if [[ -n "$DOCUMENT_ROOT" ]]; then
+            echo "    location / { try_files \$uri \$uri/ =404; }"
+        fi
+        echo "    access_log /var/log/nginx/${primary}_access.log;"
+        echo "    error_log  /var/log/nginx/${primary}_error.log;"
+        echo "}"
+    } > "$WS_VHOST_FILE"
+    if [[ "$WS_VHOST_FILE" == /etc/nginx/sites-available/* ]]; then
+        ln -sfn "$WS_VHOST_FILE" "/etc/nginx/sites-enabled/${primary}.conf"
+    fi
+}
+apache_enable_site() {
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+        local primary="${DOMAINS[0]}"
+        [[ -L "/etc/apache2/sites-enabled/${primary}.conf" ]] || a2ensite "${primary}" >/dev/null
+    fi
+}
+nginx_enable_site() { :; }
+ws_configtest() {
+    if [[ "$WS_NAME" == "apache" ]]; then
+        if [[ "$OS_FAMILY" == "debian" ]]; then apache2ctl configtest 2>&1 | sed 's/^/    /'
+        else                                     httpd     -t           2>&1 | sed 's/^/    /'
+        fi
+    else
+        nginx -t 2>&1 | sed 's/^/    /'
+    fi
+}
+ws_reload() { systemctl reload "$WS_SERVICE"; }
+
+apache_apply_hsts() {
+    local primary="${DOMAINS[0]}"
+    local ssl_conf=""
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+        ssl_conf="/etc/apache2/sites-available/${primary}-le-ssl.conf"
+    else
+        ssl_conf="$WS_VHOST_FILE"
+    fi
+    [[ -f "$ssl_conf" ]] || { warn "conf SSL não encontrado em ${ssl_conf} — HSTS não aplicado"; return; }
+    grep -q "Strict-Transport-Security" "$ssl_conf" && { ok "HSTS já presente."; return; }
+    if [[ "$OS_FAMILY" == "debian" ]]; then a2enmod headers >/dev/null 2>&1 || true; fi
+    sed -i "/ServerName ${primary//./\\.}/a \    Header always set Strict-Transport-Security \"max-age=31536000; includeSubDomains\"\n    Header always set X-Content-Type-Options \"nosniff\"" "$ssl_conf"
+    ws_configtest; ws_reload
+    ok "HSTS ativado em ${ssl_conf}."
+}
+nginx_apply_hsts() {
+    [[ -f "$WS_VHOST_FILE" ]] || { warn "vhost não encontrado — HSTS não aplicado"; return; }
+    grep -q "Strict-Transport-Security" "$WS_VHOST_FILE" && { ok "HSTS já presente."; return; }
+    if grep -qE 'listen[[:space:]]+443' "$WS_VHOST_FILE"; then
+        sed -i '/listen[[:space:]]\+443/a \    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;\n    add_header X-Content-Type-Options "nosniff" always;' "$WS_VHOST_FILE"
+        ws_configtest; ws_reload
+        ok "HSTS ativado em ${WS_VHOST_FILE}."
+    else
+        warn "não achei bloco 'listen 443' — certbot não rodou? HSTS não aplicado."
+    fi
+}
+ws_apply_hsts() {
+    if [[ "$WS_NAME" == "apache" ]]; then apache_apply_hsts
+    else                                   nginx_apply_hsts
+    fi
+}
+
+# =============================================================================
+# FLUXO PRINCIPAL
+# =============================================================================
+
+pick_webserver
+install_webserver_if_needed
+ensure_webserver_running
+detect_firewall
 
 # ---------- coleta interativa -------------------------------------------------
 if [[ ${#DOMAINS[@]} -eq 0 ]]; then
     echo
-    info "Informe o domínio que deve receber HTTPS (FQDN, sem https://)."
-    info "Ex: app.example.com.br"
+    info "Informe o domínio (FQDN, sem https://). Ex: app.example.com.br"
     primary="$(prompt 'Domínio principal')"
     [[ -n "$primary" ]] || die "domínio é obrigatório"
     DOMAINS+=("$primary")
-    while confirm "Adicionar outro domínio/alias para o mesmo certificado (ex: www.${primary})?"; do
+    while confirm "Adicionar outro domínio/alias ao mesmo certificado (ex: www.${primary})?"; do
         alt="$(prompt 'Domínio adicional')"
         [[ -n "$alt" ]] && DOMAINS+=("$alt")
     done
@@ -183,13 +448,13 @@ fi
 
 if [[ -z "$REDIRECT_ROOT" ]] && [[ "$ASSUME_YES" != "yes" ]]; then
     echo
-    info "Quando alguém abrir https://${DOMAINS[0]}/ , o que deve carregar?"
-    info "  - Vazio (Enter) = serve o que o Apache já serve hoje em /."
-    info "  - Path /xxx/   = redireciona / -> /xxx/ (ex: /zabbix/, /grafana/)."
+    info "O que carregar quando alguém abrir https://${DOMAINS[0]}/ ?"
+    info "  - Vazio (Enter) = serve o que o webserver já serve hoje em /"
+    info "  - Path /xxx/    = redireciona /  →  /xxx/  (ex: /zabbix/, /grafana/)"
     sug=""
-    if [[ -f /etc/apache2/conf-enabled/zabbix.conf ]]; then
+    if [[ -f /etc/apache2/conf-enabled/zabbix.conf ]] || [[ -f /etc/httpd/conf.d/zabbix.conf ]]; then
         sug="/zabbix/"
-        info "${C_YLW}detectei /etc/apache2/conf-enabled/zabbix.conf — sugerindo /zabbix/${C_RST}"
+        info "${C_YLW}detectei zabbix.conf — sugerindo /zabbix/${C_RST}"
     fi
     REDIRECT_ROOT="$(prompt 'Redirect raiz para' "$sug")"
 fi
@@ -200,89 +465,95 @@ fi
 
 if [[ -z "$DOCUMENT_ROOT" ]] && [[ -z "$REDIRECT_ROOT" ]] && [[ "$ASSUME_YES" != "yes" ]]; then
     echo
-    info "DocumentRoot do VirtualHost (deixe vazio para usar o default do Apache)."
-    info "Ex: /var/www/meuapp"
+    info "DocumentRoot do VHost (deixe vazio para usar o default). Ex: /var/www/app"
     DOCUMENT_ROOT="$(prompt 'DocumentRoot' '')"
 fi
-if [[ -n "$DOCUMENT_ROOT" ]]; then
-    [[ -d "$DOCUMENT_ROOT" ]] || warn "DocumentRoot ${DOCUMENT_ROOT} não existe ainda (Apache pode falhar)."
-fi
+[[ -n "$DOCUMENT_ROOT" && ! -d "$DOCUMENT_ROOT" ]] && warn "DocumentRoot ${DOCUMENT_ROOT} não existe ainda."
 
 if [[ "$ENABLE_HSTS" == "no" ]] && [[ "$ASSUME_YES" != "yes" ]]; then
     echo
-    if confirm "Ativar HSTS (Strict-Transport-Security) no VHost HTTPS?"; then
-        ENABLE_HSTS="yes"
-    fi
+    confirm "Ativar HSTS (Strict-Transport-Security) no HTTPS?" && ENABLE_HSTS="yes"
 fi
 
-# ---------- validação DNS -----------------------------------------------------
+# ---------- DNS ---------------------------------------------------------------
 echo
 info "Validando DNS..."
-PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
+            || curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
+            || true)"
 info "  IP público desta máquina: ${PUBLIC_IP:-desconhecido}"
 DNS_PROBLEMS=0
 for d in "${DOMAINS[@]}"; do
     ips="$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
     if [[ -z "$ips" ]]; then
-        err "  ${d}: DNS NÃO resolve (verifique o registro A)."
-        DNS_PROBLEMS=$((DNS_PROBLEMS+1))
-        continue
+        err "  ${d}: DNS NÃO resolve (verifique o registro A)"
+        DNS_PROBLEMS=$((DNS_PROBLEMS+1)); continue
     fi
     if [[ -n "$PUBLIC_IP" ]] && ! echo "$ips" | grep -qw "$PUBLIC_IP"; then
-        warn "  ${d} -> ${ips} (não bate com o IP público ${PUBLIC_IP})"
+        warn "  ${d} -> ${ips} (não bate com IP público ${PUBLIC_IP})"
         DNS_PROBLEMS=$((DNS_PROBLEMS+1))
     else
-        ok "  ${d} -> ${ips}"
+        ok   "  ${d} -> ${ips}"
     fi
 done
 if [[ $DNS_PROBLEMS -gt 0 ]]; then
-    warn "Há ${DNS_PROBLEMS} domínio(s) com problema de DNS — o certbot vai falhar no challenge HTTP-01."
-    confirm "Continuar mesmo assim?" || die "abortado pelo usuário"
+    warn "${DNS_PROBLEMS} domínio(s) com problema de DNS — certbot pode falhar."
+    confirm "Continuar?" || die "abortado"
 fi
 
-# ---------- VirtualHost duplicado? -------------------------------------------
+# ---------- vhost path / duplicado -------------------------------------------
 PRIMARY="${DOMAINS[0]}"
-SITE_CONF="/etc/apache2/sites-available/${PRIMARY}.conf"
-DUP="$(grep -rlE "^\s*ServerName\s+${PRIMARY//./\\.}\b" /etc/apache2/sites-enabled/ 2>/dev/null | grep -v "${PRIMARY}.conf" || true)"
-if [[ -n "$DUP" ]]; then
-    warn "Já existe(m) VirtualHost(s) ativo(s) com ServerName=${PRIMARY}:"
-    echo "$DUP" | sed 's/^/    /'
-    confirm "Continuar e deixar Apache decidir qual usar (geralmente o que tiver carregado primeiro)?" \
-        || die "abortado — desabilite o(s) site(s) conflitante(s) com 'a2dissite' e rode de novo"
+if [[ "$WS_NAME" == "apache" ]]; then WS_VHOST_FILE="$(apache_vhost_path "$PRIMARY")"
+else                                  WS_VHOST_FILE="$(nginx_vhost_path  "$PRIMARY")"
 fi
 
-# ---------- firewall ----------------------------------------------------------
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    if ! ufw status | grep -qE "^(80|443)/tcp\s+ALLOW"; then
-        warn "UFW está ativo e parece NÃO permitir 80/443/tcp."
-        if [[ "$OPEN_FIREWALL" == "yes" ]] || confirm "Abrir 80/443/tcp no UFW agora?"; then
-            ufw allow 80/tcp  || true
-            ufw allow 443/tcp || true
-            ok "UFW: portas 80 e 443 liberadas."
-        fi
+DUP_SEARCH_DIRS=()
+[[ -d /etc/apache2/sites-enabled ]] && DUP_SEARCH_DIRS+=(/etc/apache2/sites-enabled)
+[[ -d /etc/httpd/conf.d         ]] && DUP_SEARCH_DIRS+=(/etc/httpd/conf.d)
+[[ -d /etc/nginx/sites-enabled  ]] && DUP_SEARCH_DIRS+=(/etc/nginx/sites-enabled)
+[[ -d /etc/nginx/conf.d         ]] && DUP_SEARCH_DIRS+=(/etc/nginx/conf.d)
+if [[ ${#DUP_SEARCH_DIRS[@]} -gt 0 ]]; then
+    DUP="$(grep -rlE "(server_name|ServerName)[[:space:]]+${PRIMARY//./\\.}\b" "${DUP_SEARCH_DIRS[@]}" 2>/dev/null \
+           | grep -v -F "$WS_VHOST_FILE" || true)"
+    if [[ -n "$DUP" ]]; then
+        warn "Já existe(m) vhost(s) com ${PRIMARY}:"
+        echo "$DUP" | sed 's/^/    /'
+        confirm "Continuar mesmo assim?" || die "abortado — desabilite o conflitante e rode de novo"
     fi
 fi
 
-# ---------- resumo + confirmação ---------------------------------------------
+# ---------- firewall ----------------------------------------------------------
+if [[ "$FIREWALL_KIND" != "none" ]] && firewall_is_blocking_web; then
+    warn "Firewall (${FIREWALL_KIND}) parece NÃO permitir 80/443."
+    if [[ "$OPEN_FIREWALL" == "yes" ]] || confirm "Abrir 80/443 no ${FIREWALL_KIND} agora?"; then
+        firewall_open_web
+    fi
+fi
+
+# ---------- resumo + confirma ------------------------------------------------
 echo
 hr
 log "${C_BLD}Resumo:${C_RST}"
-log "  Domínios       : ${DOMAINS[*]}"
-log "  E-mail LE      : $EMAIL"
-log "  Redirect raiz  : ${REDIRECT_ROOT:-(nenhum)}"
-log "  DocumentRoot   : ${DOCUMENT_ROOT:-(default Apache)}"
-log "  HTTP->HTTPS    : $HTTP_REDIRECT"
-log "  HSTS           : $ENABLE_HSTS"
-log "  Staging mode   : $USE_STAGING"
-log "  IP público     : ${PUBLIC_IP:-?}"
+log "  SO              : ${OS_PRETTY} (${OS_FAMILY})"
+log "  Webserver       : ${WS_NAME} (serviço: ${WS_SERVICE})"
+log "  Domínios        : ${DOMAINS[*]}"
+log "  E-mail LE       : $EMAIL"
+log "  Redirect raiz   : ${REDIRECT_ROOT:-(nenhum)}"
+log "  DocumentRoot    : ${DOCUMENT_ROOT:-(default)}"
+log "  HTTP->HTTPS     : $HTTP_REDIRECT"
+log "  HSTS            : $ENABLE_HSTS"
+log "  Staging         : $USE_STAGING"
+log "  Firewall        : $FIREWALL_KIND"
+log "  Vhost           : $WS_VHOST_FILE"
+log "  IP público      : ${PUBLIC_IP:-?}"
 hr
 confirm "Prosseguir?" || die "abortado"
 
-# ---------- rollback infra ----------------------------------------------------
+# ---------- rollback infra ---------------------------------------------------
 BACKUP_TAG="$(date +%Y%m%d-%H%M%S)"
 ROLLBACK_CMDS=()
 add_rollback() { ROLLBACK_CMDS+=("$1"); }
-do_rollback() {
+do_rollback()  {
     warn "Executando rollback..."
     for (( i=${#ROLLBACK_CMDS[@]}-1; i>=0; i-- )); do
         bash -c "${ROLLBACK_CMDS[$i]}" || true
@@ -290,128 +561,96 @@ do_rollback() {
 }
 trap 'rc=$?; if [[ $rc -ne 0 ]]; then err "falha (exit $rc) — revertendo"; do_rollback; fi' EXIT
 
-# ---------- etapa 1: certbot --------------------------------------------------
+# ---------- [1/6] certbot -----------------------------------------------------
 echo
-info "[1/6] Instalando certbot + python3-certbot-apache"
+info "[1/6] Instalando certbot + plugin ${WS_NAME}"
 if command -v certbot >/dev/null 2>&1; then
     ok "  certbot já instalado: $(certbot --version 2>&1)"
 else
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot python3-certbot-apache
+    pkg_install certbot "$WS_CB_PKG"
     ok "  certbot instalado: $(certbot --version 2>&1)"
 fi
 
-# ---------- etapa 2: VirtualHost HTTP ----------------------------------------
+# ---------- [2/6] VHost -------------------------------------------------------
 echo
-info "[2/6] Criando VirtualHost HTTP em ${SITE_CONF}"
-if [[ -f "$SITE_CONF" ]]; then
-    backup="${SITE_CONF}.bak.${BACKUP_TAG}"
-    cp -a "$SITE_CONF" "$backup"
-    info "  ${SITE_CONF} já existia — backup em ${backup}"
-    add_rollback "mv -f '$backup' '$SITE_CONF'"
+info "[2/6] Escrevendo VHost ${WS_VHOST_FILE}"
+mkdir -p "$(dirname "$WS_VHOST_FILE")"
+if [[ -f "$WS_VHOST_FILE" ]]; then
+    backup="${WS_VHOST_FILE}.bak.${BACKUP_TAG}"
+    cp -a "$WS_VHOST_FILE" "$backup"
+    info "  já existia — backup em ${backup}"
+    add_rollback "mv -f '$backup' '$WS_VHOST_FILE'"
 else
-    add_rollback "rm -f '$SITE_CONF'"
+    add_rollback "rm -f '$WS_VHOST_FILE'"
 fi
-
-{
-    echo "<VirtualHost *:80>"
-    echo "    ServerName ${DOMAINS[0]}"
-    for d in "${DOMAINS[@]:1}"; do
-        echo "    ServerAlias ${d}"
-    done
-    [[ -n "$DOCUMENT_ROOT" ]] && echo "    DocumentRoot ${DOCUMENT_ROOT}"
-    if [[ -n "$REDIRECT_ROOT" ]]; then
-        echo "    RedirectMatch ^/\$ ${REDIRECT_ROOT}"
-    fi
-    if [[ -n "$DOCUMENT_ROOT" ]]; then
-        echo "    <Directory ${DOCUMENT_ROOT}>"
-        echo "        Options FollowSymLinks"
-        echo "        AllowOverride All"
-        echo "        Require all granted"
-        echo "    </Directory>"
-    fi
-    echo "    ErrorLog \${APACHE_LOG_DIR}/${PRIMARY}_error.log"
-    echo "    CustomLog \${APACHE_LOG_DIR}/${PRIMARY}_access.log combined"
-    echo "</VirtualHost>"
-} > "$SITE_CONF"
-
-apache2ctl configtest 2>&1 | sed 's/^/    /'
-
-# ---------- etapa 3: a2ensite + reload ---------------------------------------
-echo
-info "[3/6] Habilitando site e recarregando Apache"
-if [[ ! -L "/etc/apache2/sites-enabled/${PRIMARY}.conf" ]]; then
-    a2ensite "${PRIMARY}" >/dev/null
-    add_rollback "a2dissite '${PRIMARY}' >/dev/null && systemctl reload apache2"
+if [[ "$WS_NAME" == "apache" ]]; then apache_write_vhost
+else                                  nginx_write_vhost
 fi
-systemctl reload apache2
-ok "  Apache recarregado."
+ws_configtest
 
-# ---------- etapa 4: certbot --------------------------------------------------
+# ---------- [3/6] enable + reload --------------------------------------------
 echo
-info "[4/6] Solicitando certificado Let's Encrypt (HTTP-01 / plugin apache)"
-CERTBOT_ARGS=(--apache -m "$EMAIL" --non-interactive --agree-tos --keep-until-expiring)
+info "[3/6] Habilitando site e recarregando ${WS_SERVICE}"
+if [[ "$WS_NAME" == "apache" ]]; then apache_enable_site
+else                                  nginx_enable_site
+fi
+add_rollback "if [[ '$WS_NAME' == apache && '$OS_FAMILY' == debian ]]; then a2dissite '$PRIMARY' >/dev/null 2>&1 || true; fi; \
+              if [[ '$WS_NAME' == nginx ]]; then rm -f '/etc/nginx/sites-enabled/${PRIMARY}.conf'; fi; \
+              systemctl reload $WS_SERVICE || true"
+ws_reload
+ok "  ${WS_SERVICE} recarregado."
+
+# ---------- [4/6] certbot run -------------------------------------------------
+echo
+info "[4/6] Solicitando certificado Let's Encrypt (HTTP-01 / plugin ${WS_NAME})"
+CERTBOT_ARGS=("$WS_CB_FLAG" -m "$EMAIL" --non-interactive --agree-tos --keep-until-expiring)
 for d in "${DOMAINS[@]}"; do CERTBOT_ARGS+=(-d "$d"); done
 [[ "$HTTP_REDIRECT" == "yes" ]] && CERTBOT_ARGS+=(--redirect) || CERTBOT_ARGS+=(--no-redirect)
 [[ "$USE_STAGING"   == "yes" ]] && CERTBOT_ARGS+=(--staging)
 certbot "${CERTBOT_ARGS[@]}"
 add_rollback "certbot delete --cert-name '${PRIMARY}' --non-interactive >/dev/null 2>&1 || true"
 
-# ---------- etapa 5: HSTS opcional -------------------------------------------
-SSL_CONF="/etc/apache2/sites-available/${PRIMARY}-le-ssl.conf"
-if [[ "$ENABLE_HSTS" == "yes" ]] && [[ -f "$SSL_CONF" ]]; then
-    echo
-    info "[5/6] Aplicando HSTS em ${SSL_CONF}"
-    if ! grep -q "Strict-Transport-Security" "$SSL_CONF"; then
-        backup="${SSL_CONF}.bak.${BACKUP_TAG}"
-        cp -a "$SSL_CONF" "$backup"
-        add_rollback "mv -f '$backup' '$SSL_CONF' && systemctl reload apache2"
-        a2enmod headers >/dev/null 2>&1 || true
-        # injeta as 2 linhas logo após ServerName
-        sed -i "/ServerName ${PRIMARY//./\\.}/a \    Header always set Strict-Transport-Security \"max-age=31536000; includeSubDomains\"\n    Header always set X-Content-Type-Options \"nosniff\"" "$SSL_CONF"
-        apache2ctl configtest
-        systemctl reload apache2
-        ok "  HSTS ativado."
-    else
-        ok "  HSTS já presente — nada a fazer."
-    fi
+# ---------- [5/6] HSTS --------------------------------------------------------
+echo
+if [[ "$ENABLE_HSTS" == "yes" ]]; then
+    info "[5/6] Aplicando HSTS"
+    ws_apply_hsts
 else
-    echo
-    info "[5/6] HSTS: pulado (não solicitado ou conf SSL ainda não existe)"
+    info "[5/6] HSTS: pulado (não solicitado)"
 fi
 
-# ---------- etapa 6: validação ------------------------------------------------
+# ---------- [6/6] validação ---------------------------------------------------
 echo
 info "[6/6] Validando endpoints"
 hr
 for d in "${DOMAINS[@]}"; do
     echo "  http://${d}/ :"
-    curl -sI --max-time 10 "http://${d}/" | head -3 | sed 's/^/      /' || warn "curl HTTP falhou em ${d}"
+    curl -sI --max-time 10 "http://${d}/"  | head -3 | sed 's/^/      /' || warn "  curl HTTP falhou em ${d}"
     echo "  https://${d}/ :"
-    curl -sI --max-time 10 "https://${d}/" | head -3 | sed 's/^/      /' || warn "curl HTTPS falhou em ${d}"
+    curl -sI --max-time 10 "https://${d}/" | head -3 | sed 's/^/      /' || warn "  curl HTTPS falhou em ${d}"
 done
 if [[ -n "$REDIRECT_ROOT" ]]; then
     echo "  https://${PRIMARY}${REDIRECT_ROOT} :"
-    curl -sI --max-time 10 "https://${PRIMARY}${REDIRECT_ROOT}" | head -3 | sed 's/^/      /' || warn "curl path falhou"
+    curl -sI --max-time 10 "https://${PRIMARY}${REDIRECT_ROOT}" | head -3 | sed 's/^/      /' || true
 fi
 hr
 
-# status do timer de renew
 echo
 info "Renovação automática:"
 systemctl list-timers --no-pager 2>/dev/null | grep -E "certbot|snap\.certbot" | sed 's/^/    /' \
-    || warn "não encontrei timer de certbot — verifique 'systemctl list-timers' manualmente"
+    || warn "  não achei timer de certbot — verifique 'systemctl list-timers' / 'crontab -l' manualmente"
 
 echo
-info "Lista de certificados:"
+info "Lista de certificados emitidos:"
 certbot certificates 2>/dev/null | sed 's/^/    /' || true
 
-# desarmar rollback — sucesso
 trap - EXIT
 echo
 ok "${C_BLD}Concluído com sucesso.${C_RST}"
 echo
-echo "  Para revogar este cert:    sudo certbot delete --cert-name ${PRIMARY}"
-echo "  Para desabilitar o site:   sudo a2dissite ${PRIMARY} && sudo systemctl reload apache2"
-echo "  Para renovar manualmente:  sudo certbot renew"
-echo "  Log desta execução:        ${LOG_FILE}"
+echo "  Revogar cert:        sudo certbot delete --cert-name ${PRIMARY}"
+echo "  Desabilitar site:    sudo rm ${WS_VHOST_FILE} && sudo systemctl reload ${WS_SERVICE}"
+[[ "$OS_FAMILY" == debian && "$WS_NAME" == apache ]] && \
+    echo "                       (ou: sudo a2dissite ${PRIMARY} && sudo systemctl reload apache2)"
+echo "  Renovar manualmente: sudo certbot renew"
+echo "  Log execução:        ${LOG_FILE}"
