@@ -1,17 +1,21 @@
 # autossl
 
-Script Bash que instala um certificado **Let's Encrypt** e configura **HTTPS** em um servidor Linux com **Apache** ou **Nginx**. Detecta o SO e o webserver, instala o que faltar (com confirmação), e termina com tudo validado.
+Script Bash que instala um certificado **Let's Encrypt** (ou ZeroSSL) e configura **HTTPS** em um servidor Linux com **Apache** ou **Nginx**. Detecta o SO, o webserver, e o cenário de DNS — escolhe automaticamente entre HTTP-01 e DNS-01 conforme o caso.
 
-Funciona em Debian/Ubuntu **e** em RHEL/CentOS/Rocky/Alma/Fedora — o script escolhe o pacote certo (`apt-get` ou `dnf`), o serviço certo (`apache2` vs `httpd`, ou `nginx`) e o plugin certo do certbot, sem você precisar pensar nisso.
+Funciona em Debian/Ubuntu **e** em RHEL/CentOS/Rocky/Alma/Fedora. Cobre dois cenários:
 
-## Pré-requisito (responsabilidade do operador)
+- **Domínio público** (acesso pela Internet) → `certbot` + HTTP-01
+- **Domínio aponta pra IP privado** (intranet/NAT/VPN) → `acme.sh` + DNS-01 via API do cPanel do provedor DNS (cria/remove o TXT `_acme-challenge` sozinho — sem clicar e-mail, sem editar DNS manual)
+
+## Pré-requisito
 
 Antes de rodar:
 
-1. O domínio (registro **A** no DNS) precisa apontar para o **IP público** do servidor. Aguarde a propagação (`dig A seudominio.com.br` deve retornar o IP correto).
-2. Portas **80** e **443** acessíveis pela Internet (firewall, NAT, security group em cloud).
+1. O domínio (registro **A** no DNS) precisa apontar pra um IP (público OU privado, conforme o caso).
+2. Se o caso é HTTP-01: portas **80** e **443** acessíveis pela Internet.
+3. Se o caso é DNS-01 cPanel: credenciais cPanel do provedor DNS (`CPANEL_USERNAME`, `CPANEL_APITOKEN`, `CPANEL_HOSTNAME`). Pode passar por env var ou deixar o script perguntar (token via `read -s`, sem echo).
 
-Depois disso, o script faz o resto.
+Depois disso, o script decide e faz o resto.
 
 ## Compatibilidade
 
@@ -47,7 +51,7 @@ O script vai:
 
 Em qualquer falha → **rollback automático** (backup do conf restaurado, site desabilitado, cert deletado).
 
-## Uso não-interativo (CI / automação)
+## Uso não-interativo — HTTP-01 (DNS público)
 
 ```bash
 sudo bash /tmp/autossl.sh \
@@ -59,41 +63,76 @@ sudo bash /tmp/autossl.sh \
     --hsts --open-firewall --yes
 ```
 
+## Uso não-interativo — DNS-01 cPanel (intranet, IP privado)
+
+```bash
+export CPANEL_USERNAME='...'
+export CPANEL_APITOKEN='...'
+export CPANEL_HOSTNAME='https://canopus.prodns.com.br:2083'
+
+sudo -E bash /tmp/autossl.sh \
+    --method acme-sh-cpanel \
+    -d intra.example.com.br \
+    --email admin@example.com.br \
+    --document-root /var/www/intra --yes
+```
+
+> Use `sudo -E` para o sudo preservar as env vars `CPANEL_*`.
+
 ## Flags
 
 | Flag | O que faz |
 |---|---|
+| `--method M`                | `auto` (default) \| `certbot-http01` \| `acme-sh-cpanel`. Em `auto`, o script decide pelo DNS: se o domínio só resolve pra IP privado → `acme-sh-cpanel`; senão → `certbot-http01` |
+| `--ca CA`                   | `letsencrypt` (default) \| `zerossl`. ZeroSSL em conta nova frequentemente devolve `retry_after=86400`; o script faz fallback automático pra LE nesse caso |
 | `--webserver apache\|nginx` | força um webserver (default: detecta/pergunta) |
 | `-d, --domain DOM`          | domínio (pode repetir; o primeiro é o principal; os demais viram `ServerAlias`/`server_name` extra e entram no SAN do cert) |
-| `--email EMAIL`             | e-mail da conta Let's Encrypt |
+| `--email EMAIL`             | e-mail da conta da CA |
 | `--redirect-root PATH`      | `/` → `PATH` (ex: `/zabbix/`). Vazio = não redireciona |
 | `--document-root DIR`       | `DocumentRoot` (Apache) ou `root` (Nginx) do VHost |
-| `--staging`                 | usa staging do Let's Encrypt — cert não confiável, ideal pra teste sem queimar rate-limit |
+| `--staging`                 | usa staging do Let's Encrypt — só vale com `--method certbot-http01` |
 | `--no-http-redirect`        | NÃO força redirect HTTP→HTTPS (default: força) |
 | `--hsts`                    | adiciona HSTS no VHost SSL após emitir o cert |
 | `--open-firewall`           | abre 80/443/tcp no UFW **ou** http/https no firewalld se ativos |
 | `--install-webserver`       | instala o webserver escolhido sem perguntar |
+| `--certbot-method M`        | `auto` (default) \| `pkg` \| `snap` \| `keep`. Em SO antigos como CentOS 7 a fallback automática é `snap` (o script detecta e oferece) |
 | `-y, --yes`                 | não pede nenhuma confirmação |
 | `-h, --help`                | ajuda completa |
+
+## Credenciais cPanel (modo `acme-sh-cpanel`)
+
+Necessárias só nesse modo. Três jeitos seguros de fornecer (o script tenta nessa ordem):
+
+1. **Env vars** antes do `sudo`:
+   ```bash
+   export CPANEL_USERNAME='...'
+   export CPANEL_APITOKEN='...'
+   export CPANEL_HOSTNAME='https://provedor.cpanel:2083'
+   sudo -E bash autossl.sh --method acme-sh-cpanel ...
+   ```
+2. **Já salvas** em `/root/.acme.sh/account.conf` (segunda emissão na mesma máquina). Script detecta `SAVED_cPanel_Username=` e nem pergunta.
+3. **Prompt interativo**. Username e Hostname aparecem na tela; o **token NÃO** (usa `read -s`, sem echo, fora do scrollback).
+
+⚠️ **NÃO existe flag `--cpanel-token`.** Foi de propósito: flags vazariam no histórico do shell. Use uma das três rotas acima.
 
 ## O que o script faz por dentro
 
 1. **Detecta SO** via `/etc/os-release` (família + versão) e mostra status de compatibilidade.
 2. **Escolhe o webserver** (Apache ou Nginx). Detecta o que já está instalado; se nada, pergunta.
 3. **Instala o webserver** se ausente (sob confirmação) — `apt install apache2/nginx` ou `dnf install httpd/nginx`. EPEL é adicionado automaticamente em RHEL family quando preciso.
-4. **Detecta firewall** ativo (UFW ou firewalld) e oferece abrir 80/443.
-5. **Valida DNS** — resolve cada domínio e compara com o IP público (`api.ipify.org`/`ifconfig.me`).
-6. **Detecta VHost duplicado** com mesmo `ServerName`/`server_name` em outros sites ativos.
-7. **Escreve VHost**:
-   - Apache (Debian) → `/etc/apache2/sites-available/<dom>.conf` + `a2ensite`
-   - Apache (RHEL)   → `/etc/httpd/conf.d/<dom>.conf`
-   - Nginx (Debian)  → `/etc/nginx/sites-available/<dom>.conf` + symlink
-   - Nginx (RHEL)    → `/etc/nginx/conf.d/<dom>.conf`
-8. **Roda configtest** (`apache2ctl -t` / `httpd -t` / `nginx -t`) antes de recarregar.
-9. **Emite o cert** com `certbot --apache` ou `--nginx`, `--redirect` (HTTP→HTTPS), `--keep-until-expiring` (idempotente).
-10. **HSTS opcional** — injeta `Strict-Transport-Security` e `X-Content-Type-Options` no VHost SSL.
-11. **Validação final** — `curl -sI` em HTTP, HTTPS e (se houver redirect-root) no path final.
-12. **Renovação** — mostra o timer systemd do certbot já configurado pelo pacote.
+4. **Detecta firewall** ativo (UFW ou firewalld) e oferece abrir 80/443 (só relevante pra HTTP-01).
+5. **Valida DNS** — resolve cada domínio, classifica (IP público correto, IP público errado, IP privado) e mostra mensagem específica pra cada caso.
+6. **Decide o método** (em `--method auto`): IP privado → `acme-sh-cpanel`; senão → `certbot-http01`.
+7. **Instala a ferramenta certa** — `certbot` (com fallback pra snap em SO antigo) OU `acme.sh` + deps.
+8. **Detecta VHost duplicado** com mesmo `ServerName`/`server_name` em outros sites ativos.
+9. **Escreve VHost** (path varia por SO e webserver — ver `/etc/apache2/sites-available/`, `/etc/httpd/conf.d/`, `/etc/nginx/sites-available/`, `/etc/nginx/conf.d/`).
+10. **Roda configtest** (`apache2ctl -t` / `httpd -t` / `nginx -t`) antes de recarregar.
+11. **Emite o cert**:
+    - **HTTP-01**: `certbot --apache/--nginx --redirect --keep-until-expiring`
+    - **DNS-01 cPanel**: `acme.sh --issue --dns dns_cpanel`, depois `--install-cert` com `--reloadcmd "systemctl reload <ws>"` (deixa renovação configurada). VHost SSL escrito manualmente.
+12. **HSTS opcional** — injeta `Strict-Transport-Security` e `X-Content-Type-Options`.
+13. **Validação final** — `curl -sI` em HTTP, HTTPS e (se houver redirect-root) no path final.
+14. **Renovação automática** — `certbot.timer` (systemd) OU `acme.sh --cron` (crontab). Mostra o status no final.
 
 Log de cada execução: `/var/log/autossl.log`.
 

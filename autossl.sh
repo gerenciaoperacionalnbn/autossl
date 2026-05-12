@@ -30,33 +30,64 @@
 #   - Apache (apache2 no Debian/Ubuntu, httpd no RHEL family)
 #   - Nginx
 #
+# Métodos de emissão suportados:
+#   - certbot-http01    (default em DNS público) — usa certbot, validação por
+#                       HTTP-01. Requer IP público da máquina acessível pela
+#                       Internet nas portas 80/443.
+#   - acme-sh-cpanel    Usa acme.sh + plugin dns_cpanel para validação DNS-01:
+#                       o script fala com a API do cPanel do provedor DNS e
+#                       cria/remove o TXT _acme-challenge sozinho. ÚTIL quando
+#                       o domínio aponta para um IP privado (intranet, NAT),
+#                       que é cenário em que o HTTP-01 falha. Requer 3 vars
+#                       (não pode ser passada via flag — vazaria no histórico):
+#                           CPANEL_USERNAME, CPANEL_APITOKEN, CPANEL_HOSTNAME
+#                       Setadas como env vars OU lidas via prompt seguro
+#                       (token usa read -s, sem echo).
+#   - auto              (default) decide pela detecção do DNS: se o domínio
+#                       resolve só para IP privado → acme-sh-cpanel; senão →
+#                       certbot-http01.
+#
 # Uso (interativo — recomendado):
 #     sudo bash autossl.sh
 #
-# Uso não-interativo (CI / automação):
+# Uso não-interativo, HTTP-01 (DNS público):
 #     sudo bash autossl.sh \
 #         --webserver apache \
 #         -d app.example.com.br \
-#         -d www.app.example.com.br \
 #         --email admin@example.com.br \
-#         --redirect-root /zabbix/ \
 #         --hsts --open-firewall --yes
+#
+# Uso não-interativo, DNS-01 cPanel (intranet):
+#     export CPANEL_USERNAME='...'
+#     export CPANEL_APITOKEN='...'
+#     export CPANEL_HOSTNAME='https://canopus.prodns.com.br:2083'
+#     sudo -E bash autossl.sh \
+#         --method acme-sh-cpanel \
+#         -d intra.example.com.br \
+#         --email admin@example.com.br \
+#         --document-root /var/www/intra --yes
 #
 # Flags:
 #   --webserver apache|nginx  força um webserver (default: detecta/pergunta)
+#   --method M                certbot-http01 | acme-sh-cpanel | auto (default)
+#   --ca CA                   letsencrypt | zerossl (default: letsencrypt — a
+#                             ZeroSSL em conta nova frequentemente devolve
+#                             retry_after=86400 e o acme.sh aborta)
 #   -d, --domain DOM          domínio (pode repetir; 1º é o principal)
-#   --email EMAIL             e-mail para conta Let's Encrypt
+#   --email EMAIL             e-mail para conta Let's Encrypt / ZeroSSL
 #   --redirect-root PATH      "/" → PATH (ex: /zabbix/). Vazio = não redireciona
 #   --document-root DIR       DocumentRoot do VHost (ex: /var/www/app)
 #   --staging                 usa staging Let's Encrypt (cert não confiável)
+#                             (só vale com --method certbot-http01)
 #   --no-http-redirect        NÃO força HTTP→HTTPS (default: força)
 #   --hsts                    adiciona HSTS após emitir o cert
 #   --open-firewall           abre 80/443 (ufw OU firewalld) se ativo
 #   --install-webserver       instala o webserver escolhido sem perguntar
-#   --certbot-method METHOD   como instalar/atualizar o certbot:
-#                               auto = pacote do SO; se faltar plugin, oferece snap (default)
-#                               pkg  = só via gerenciador do SO (apt/dnf/yum)
-#                               snap = via snap (versão mais nova; útil em SO antigos como CentOS 7)
+#   --certbot-method METHOD   como instalar/atualizar o certbot (só vale com
+#                             --method certbot-http01):
+#                               auto = pacote do SO; se faltar plugin → snap
+#                               pkg  = via gerenciador do SO (apt/dnf/yum)
+#                               snap = via snap (versão mais nova)
 #                               keep = não tocar no certbot já instalado
 #   -y, --yes                 não pede nenhuma confirmação
 #   -h, --help                esta ajuda
@@ -100,6 +131,8 @@ ENABLE_HSTS="no"
 OPEN_FIREWALL="no"
 INSTALL_WS_AUTO="no"
 CERTBOT_METHOD="auto"   # auto | pkg | snap | keep
+METHOD="auto"           # auto | certbot-http01 | acme-sh-cpanel
+CA="letsencrypt"        # letsencrypt | zerossl
 ASSUME_YES="no"
 
 while [[ $# -gt 0 ]]; do
@@ -115,12 +148,16 @@ while [[ $# -gt 0 ]]; do
         --open-firewall)     OPEN_FIREWALL="yes"; shift ;;
         --install-webserver) INSTALL_WS_AUTO="yes"; shift ;;
         --certbot-method)    CERTBOT_METHOD="$2"; shift 2 ;;
+        --method)            METHOD="$2"; shift 2 ;;
+        --ca)                CA="$2"; shift 2 ;;
         -y|--yes)            ASSUME_YES="yes"; shift ;;
         -h|--help)           usage 0 ;;
         *) die "flag desconhecida: $1 (use -h para ajuda)" ;;
     esac
 done
 case "$CERTBOT_METHOD" in auto|pkg|snap|keep) ;; *) die "--certbot-method inválido: $CERTBOT_METHOD (auto|pkg|snap|keep)" ;; esac
+case "$METHOD"         in auto|certbot-http01|acme-sh-cpanel) ;; *) die "--method inválido: $METHOD (auto|certbot-http01|acme-sh-cpanel)" ;; esac
+case "$CA"             in letsencrypt|zerossl) ;; *) die "--ca inválido: $CA (letsencrypt|zerossl)" ;; esac
 
 prompt() {
     local label="$1" default="${2:-}" hint="" reply=""
@@ -520,6 +557,171 @@ install_or_update_certbot() {
     certbot_has_plugin || die "plugin '${WS_NAME}' ainda indisponível depois do snap. Investigue 'certbot plugins'."
 }
 
+# ---------- acme.sh + DNS-01 cPanel -------------------------------------------
+ACME_CERT_KEY=""
+ACME_CERT_CRT=""
+
+acme_sh_install() {
+    if [[ -x /root/.acme.sh/acme.sh ]]; then
+        info "  acme.sh já instalado: $(/root/.acme.sh/acme.sh --version 2>&1 | head -1)"
+        return 0
+    fi
+    info "  Instalando acme.sh..."
+    pkg_install curl socat
+    curl -fsSL https://get.acme.sh | sh -s "email=${EMAIL}" >/dev/null
+    [[ -x /root/.acme.sh/acme.sh ]] || die "falha instalando acme.sh"
+    ok "  acme.sh instalado: $(/root/.acme.sh/acme.sh --version 2>&1 | head -1)"
+}
+
+# Coleta credenciais cPanel SEM exibi-las no chat / scrollback.
+# Aceita: (1) env vars CPANEL_USERNAME/CPANEL_APITOKEN/CPANEL_HOSTNAME,
+#         (2) já salvas em /root/.acme.sh/account.conf (renovação/2ª emissão),
+#         (3) prompt interativo (token via read -s, sem echo).
+acme_sh_collect_cpanel_creds() {
+    if [[ -n "${CPANEL_USERNAME:-}" && -n "${CPANEL_APITOKEN:-}" && -n "${CPANEL_HOSTNAME:-}" ]]; then
+        info "  Credenciais cPanel: lidas de variáveis de ambiente."
+        return 0
+    fi
+    if [[ -f /root/.acme.sh/account.conf ]] \
+       && grep -q "^SAVED_cPanel_Username=" /root/.acme.sh/account.conf 2>/dev/null; then
+        info "  Credenciais cPanel: já salvas em /root/.acme.sh/account.conf (acme.sh vai reutilizar)."
+        return 0
+    fi
+    echo
+    info "Credenciais cPanel do provedor DNS (Hostgator etc):"
+    info "  Username e Hostname aparecem na tela; o ${C_BLD}token NÃO${C_RST} (read -s)."
+    read -r  -p "  cPanel Username : "                              CPANEL_USERNAME </dev/tty
+    read -r  -p "  cPanel Hostname (ex: https://canopus...:2083) : " CPANEL_HOSTNAME </dev/tty
+    read -rs -p "  cPanel API Token: "                              CPANEL_APITOKEN </dev/tty
+    echo
+    [[ -n "$CPANEL_USERNAME" && -n "$CPANEL_APITOKEN" && -n "$CPANEL_HOSTNAME" ]] \
+        || die "credenciais cPanel incompletas"
+    export CPANEL_USERNAME CPANEL_APITOKEN CPANEL_HOSTNAME
+}
+
+acme_sh_emit() {
+    # acme.sh espera as vars no formato cPanel_*
+    [[ -n "${CPANEL_USERNAME:-}" ]] && export cPanel_Username="$CPANEL_USERNAME"
+    [[ -n "${CPANEL_APITOKEN:-}" ]] && export cPanel_Apitoken="$CPANEL_APITOKEN"
+    [[ -n "${CPANEL_HOSTNAME:-}" ]] && export cPanel_Hostname="$CPANEL_HOSTNAME"
+
+    local args=(--issue --dns dns_cpanel)
+    for d in "${DOMAINS[@]}"; do args+=(-d "$d"); done
+    [[ "$CA" == "letsencrypt" ]] && args+=(--server letsencrypt)
+    # se CA=zerossl, deixa o default do acme.sh (que é ZeroSSL desde 3.x)
+
+    if ! /root/.acme.sh/acme.sh "${args[@]}"; then
+        if [[ "$CA" == "zerossl" ]]; then
+            warn "  Emissão via ZeroSSL falhou (provavelmente retry_after de conta nova)."
+            warn "  Tentando fallback automático para Let's Encrypt..."
+            args+=(--server letsencrypt)
+            /root/.acme.sh/acme.sh "${args[@]}" || die "falha emitindo cert via acme.sh (LE também falhou)"
+            CA="letsencrypt"
+        else
+            die "falha emitindo cert via acme.sh"
+        fi
+    fi
+}
+
+acme_sh_install_cert_files() {
+    local cert_dir
+    if [[ "$WS_NAME" == "apache" ]]; then
+        if [[ "$OS_FAMILY" == "debian" ]]; then cert_dir=/etc/apache2/ssl
+        else                                    cert_dir=/etc/httpd/ssl
+        fi
+    else
+        cert_dir=/etc/nginx/ssl
+    fi
+    mkdir -p "$cert_dir"
+    ACME_CERT_KEY="${cert_dir}/${PRIMARY}.key"
+    ACME_CERT_CRT="${cert_dir}/${PRIMARY}.crt"
+    /root/.acme.sh/acme.sh --install-cert -d "$PRIMARY" \
+        --key-file       "$ACME_CERT_KEY" \
+        --fullchain-file "$ACME_CERT_CRT" \
+        --reloadcmd      "systemctl reload ${WS_SERVICE}"
+}
+
+apache_write_vhost_ssl() {
+    local primary="${DOMAINS[0]}"
+    {
+        echo "<VirtualHost *:80>"
+        echo "    ServerName ${primary}"
+        for d in "${DOMAINS[@]:1}"; do echo "    ServerAlias ${d}"; done
+        if [[ "$HTTP_REDIRECT" == "yes" ]]; then
+            echo "    Redirect permanent / https://${primary}/"
+        else
+            [[ -n "$DOCUMENT_ROOT" ]] && echo "    DocumentRoot ${DOCUMENT_ROOT}"
+            [[ -n "$REDIRECT_ROOT" ]] && echo "    RedirectMatch ^/\$ ${REDIRECT_ROOT}"
+        fi
+        echo "</VirtualHost>"
+        echo ""
+        echo "<VirtualHost *:443>"
+        echo "    ServerName ${primary}"
+        for d in "${DOMAINS[@]:1}"; do echo "    ServerAlias ${d}"; done
+        [[ -n "$DOCUMENT_ROOT" ]] && echo "    DocumentRoot ${DOCUMENT_ROOT}"
+        [[ -n "$REDIRECT_ROOT" ]] && echo "    RedirectMatch ^/\$ ${REDIRECT_ROOT}"
+        echo ""
+        echo "    SSLEngine on"
+        echo "    SSLCertificateFile    ${ACME_CERT_CRT}"
+        echo "    SSLCertificateKeyFile ${ACME_CERT_KEY}"
+        if [[ -n "$DOCUMENT_ROOT" ]]; then
+            echo ""
+            echo "    <Directory ${DOCUMENT_ROOT}>"
+            echo "        Options FollowSymLinks"
+            echo "        AllowOverride All"
+            echo "        Require all granted"
+            echo "    </Directory>"
+        fi
+        if [[ "$OS_FAMILY" == "debian" ]]; then
+            echo "    ErrorLog  \${APACHE_LOG_DIR}/${primary}_ssl_error.log"
+            echo "    CustomLog \${APACHE_LOG_DIR}/${primary}_ssl_access.log combined"
+        else
+            echo "    ErrorLog  /var/log/httpd/${primary}_ssl_error.log"
+            echo "    CustomLog /var/log/httpd/${primary}_ssl_access.log combined"
+        fi
+        echo "</VirtualHost>"
+    } > "$WS_VHOST_FILE"
+}
+
+nginx_write_vhost_ssl() {
+    local primary="${DOMAINS[0]}"
+    {
+        echo "server {"
+        echo "    listen 80;"
+        echo "    listen [::]:80;"
+        echo "    server_name ${DOMAINS[*]};"
+        if [[ "$HTTP_REDIRECT" == "yes" ]]; then
+            echo "    return 301 https://\$host\$request_uri;"
+        else
+            [[ -n "$REDIRECT_ROOT" ]] && echo "    location = / { return 301 ${REDIRECT_ROOT}; }"
+        fi
+        echo "}"
+        echo ""
+        echo "server {"
+        echo "    listen 443 ssl http2;"
+        echo "    listen [::]:443 ssl http2;"
+        echo "    server_name ${DOMAINS[*]};"
+        echo "    ssl_certificate     ${ACME_CERT_CRT};"
+        echo "    ssl_certificate_key ${ACME_CERT_KEY};"
+        [[ -n "$DOCUMENT_ROOT" ]] && echo "    root ${DOCUMENT_ROOT};"
+        [[ -n "$REDIRECT_ROOT" ]] && echo "    location = / { return 301 ${REDIRECT_ROOT}; }"
+        if [[ -n "$DOCUMENT_ROOT" ]]; then
+            echo "    location / { try_files \$uri \$uri/ =404; }"
+        fi
+        echo "    access_log /var/log/nginx/${primary}_ssl_access.log;"
+        echo "    error_log  /var/log/nginx/${primary}_ssl_error.log;"
+        echo "}"
+    } > "$WS_VHOST_FILE"
+    if [[ "$WS_VHOST_FILE" == /etc/nginx/sites-available/* ]]; then
+        ln -sfn "$WS_VHOST_FILE" "/etc/nginx/sites-enabled/${primary}.conf"
+    fi
+}
+ws_write_vhost_ssl() {
+    if [[ "$WS_NAME" == "apache" ]]; then apache_write_vhost_ssl
+    else                                   nginx_write_vhost_ssl
+    fi
+}
+
 # =============================================================================
 # FLUXO PRINCIPAL
 # =============================================================================
@@ -528,11 +730,6 @@ pick_webserver
 install_webserver_if_needed
 ensure_webserver_running
 detect_firewall
-
-# ---------- certbot: instalar / atualizar / manter ---------------------------
-echo
-info "Certbot: instalar / atualizar / manter"
-install_or_update_certbot
 
 # ---------- coleta interativa -------------------------------------------------
 if [[ ${#DOMAINS[@]} -eq 0 ]]; then
@@ -634,16 +831,12 @@ done
 # mensagens contextuais
 if [[ $DNS_PROBLEMS_PRIVATE -gt 0 ]]; then
     echo
-    info "${C_BLD}Atenção — domínio aponta para IP privado:${C_RST}"
-    info "  Isso é normal quando a aplicação só é acessada pela intranet (VPN, rede"
-    info "  interna, NAT inverso). MAS o Let's Encrypt valida o certificado batendo"
-    info "  no domínio ${C_BLD}pela Internet pública${C_RST} (challenge HTTP-01) — se o domínio"
-    info "  só resolve para IP privado externamente, essa validação ${C_RED}vai falhar${C_RST}."
-    info "  Para HTTPS em ambiente intranet, opções comuns:"
-    info "    • DNS público apontando para o IP público + porta liberada (típico)"
-    info "    • Split-horizon DNS (público responde IP público; interno responde privado)"
-    info "    • Challenge DNS-01 do certbot (cert via TXT record) — fora do escopo deste script"
-    info "    • Certificado auto-assinado ou CA interna"
+    info "${C_BLD}Detecção: domínio aponta para IP privado (intranet/NAT).${C_RST}"
+    info "  HTTP-01 do Let's Encrypt NÃO consegue validar IP privado pela Internet."
+    info "  ${C_GRN}Este script vai usar acme.sh + DNS-01 via cPanel${C_RST} (cria/remove TXT sozinho)."
+    info "  Você precisa das credenciais cPanel do provedor DNS (Hostgator etc):"
+    info "    via env: CPANEL_USERNAME, CPANEL_APITOKEN, CPANEL_HOSTNAME"
+    info "    OU prompt interativo (token via read -s, sem echo)"
 fi
 if [[ $DNS_PROBLEMS_MISMATCH -gt 0 ]]; then
     echo
@@ -655,10 +848,38 @@ if [[ $DNS_PROBLEMS_NORESOLVE -gt 0 ]]; then
     echo
     err "${DNS_PROBLEMS_NORESOLVE} domínio(s) sem resolução DNS — corrija antes de seguir."
 fi
-if (( DNS_PROBLEMS_PRIVATE + DNS_PROBLEMS_MISMATCH + DNS_PROBLEMS_NORESOLVE > 0 )); then
+if (( DNS_PROBLEMS_MISMATCH + DNS_PROBLEMS_NORESOLVE > 0 )); then
     echo
     confirm "Continuar mesmo assim?" || die "abortado"
 fi
+
+# ---------- decisão de método (certbot HTTP-01 vs acme.sh DNS-01) ------------
+echo
+if [[ "$METHOD" == "auto" ]]; then
+    if (( DNS_PROBLEMS_PRIVATE > 0 && DNS_PROBLEMS_MISMATCH == 0 )); then
+        METHOD="acme-sh-cpanel"
+        info "Método: ${C_BLD}acme-sh-cpanel${C_RST} (escolhido automaticamente: domínio em IP privado)"
+        info "  HTTP-01 do Let's Encrypt não alcança IP privado pela Internet."
+        info "  O acme.sh fala com a API do cPanel e cria/remove o TXT _acme-challenge sozinho."
+    else
+        METHOD="certbot-http01"
+        info "Método: ${C_BLD}certbot-http01${C_RST} (escolhido automaticamente)"
+    fi
+else
+    info "Método: ${C_BLD}${METHOD}${C_RST} (forçado por --method)"
+fi
+
+case "$METHOD" in
+    certbot-http01)
+        info "Certbot: instalar / atualizar / manter"
+        install_or_update_certbot
+        ;;
+    acme-sh-cpanel)
+        info "Instalando acme.sh + coletando credenciais cPanel"
+        acme_sh_install
+        acme_sh_collect_cpanel_creds
+        ;;
+esac
 
 # ---------- vhost path / duplicado -------------------------------------------
 PRIMARY="${DOMAINS[0]}"
@@ -695,8 +916,9 @@ hr
 log "${C_BLD}Resumo:${C_RST}"
 log "  SO              : ${OS_PRETTY} (${OS_FAMILY})"
 log "  Webserver       : ${WS_NAME} (serviço: ${WS_SERVICE})"
+log "  Método          : ${METHOD}    CA: ${CA}"
 log "  Domínios        : ${DOMAINS[*]}"
-log "  E-mail LE       : $EMAIL"
+log "  E-mail          : $EMAIL"
 log "  Redirect raiz   : ${REDIRECT_ROOT:-(nenhum)}"
 log "  DocumentRoot    : ${DOCUMENT_ROOT:-(default)}"
 log "  HTTP->HTTPS     : $HTTP_REDIRECT"
@@ -749,15 +971,27 @@ add_rollback "if [[ '$WS_NAME' == apache && '$OS_FAMILY' == debian ]]; then a2di
 ws_reload
 ok "  ${WS_SERVICE} recarregado."
 
-# ---------- [3/5] certbot run -------------------------------------------------
+# ---------- [3/5] emissão do certificado -------------------------------------
 echo
-info "[3/5] Solicitando certificado Let's Encrypt (HTTP-01 / plugin ${WS_NAME})"
-CERTBOT_ARGS=("$WS_CB_FLAG" -m "$EMAIL" --non-interactive --agree-tos --keep-until-expiring)
-for d in "${DOMAINS[@]}"; do CERTBOT_ARGS+=(-d "$d"); done
-[[ "$HTTP_REDIRECT" == "yes" ]] && CERTBOT_ARGS+=(--redirect) || CERTBOT_ARGS+=(--no-redirect)
-[[ "$USE_STAGING"   == "yes" ]] && CERTBOT_ARGS+=(--staging)
-certbot "${CERTBOT_ARGS[@]}"
-add_rollback "certbot delete --cert-name '${PRIMARY}' --non-interactive >/dev/null 2>&1 || true"
+if [[ "$METHOD" == "certbot-http01" ]]; then
+    info "[3/5] Solicitando certificado via certbot (HTTP-01 / plugin ${WS_NAME})"
+    CERTBOT_ARGS=("$WS_CB_FLAG" -m "$EMAIL" --non-interactive --agree-tos --keep-until-expiring)
+    for d in "${DOMAINS[@]}"; do CERTBOT_ARGS+=(-d "$d"); done
+    [[ "$HTTP_REDIRECT" == "yes" ]] && CERTBOT_ARGS+=(--redirect) || CERTBOT_ARGS+=(--no-redirect)
+    [[ "$USE_STAGING"   == "yes" ]] && CERTBOT_ARGS+=(--staging)
+    certbot "${CERTBOT_ARGS[@]}"
+    add_rollback "certbot delete --cert-name '${PRIMARY}' --non-interactive >/dev/null 2>&1 || true"
+else
+    info "[3/5] Solicitando certificado via acme.sh (DNS-01 / cPanel — CA: ${CA})"
+    acme_sh_emit
+    acme_sh_install_cert_files
+    add_rollback "/root/.acme.sh/acme.sh --remove -d '${PRIMARY}' >/dev/null 2>&1 || true; rm -rf '/root/.acme.sh/${PRIMARY}_ecc' '/root/.acme.sh/${PRIMARY}'"
+    info "  Reescrevendo VHost com bloco SSL (acme.sh não toca no Apache/Nginx)"
+    ws_write_vhost_ssl
+    ws_configtest
+    ws_reload
+    ok "  ${WS_SERVICE} recarregado com VHost SSL."
+fi
 
 # ---------- [4/5] HSTS --------------------------------------------------------
 echo
